@@ -21,17 +21,21 @@ func handleGET(args []string, conn net.Conn) {
 		return
 	}
 	key := args[1]
-	if time.Now().After(ttlMap[key]) {
-		delete(ttlMap, key)
-		delete(globalCache, key)
-		conn.Write([]byte("Key expired\n"))
-		return
-	}
 	mu.RLock()
+	expiry, hasTTL := ttlMap[key]
 	value, ok := globalCache[key]
 	mu.RUnlock()
+
 	if !ok {
 		conn.Write([]byte("nil\n"))
+		return
+	}
+	if hasTTL && time.Now().After(expiry) {
+		mu.Lock()
+		delete(ttlMap, key)
+		delete(globalCache, key)
+		mu.Unlock()
+		conn.Write([]byte("Key expired\n"))
 		return
 	}
 	conn.Write([]byte(fmt.Sprintf("%v\n", value)))
@@ -76,6 +80,7 @@ func handleEXPIRE(args []string, conn net.Conn) {
 	mu.Lock()
 	ttlMap[key] = time.Now().Add(time.Duration(seconds) * time.Second)
 	mu.Unlock()
+	conn.Write([]byte("OK\n"))
 }
 
 func handleConnection(conn net.Conn) {
@@ -87,6 +92,7 @@ func handleConnection(conn net.Conn) {
 		message, err := reader.ReadString('\n')
 		if err != nil {
 			log.Println("Error reading from connection", err)
+			break
 		}
 
 		operation := strings.Split(strings.ToUpper(message), " ")[0]
@@ -102,13 +108,33 @@ func handleConnection(conn net.Conn) {
 		case "EXPIRE":
 			handleEXPIRE(args, conn)
 		default:
-			log.Println("Unknown operation", operation)
+			conn.Write([]byte(fmt.Sprintf("Unknown operation", operation)))
 		}
+	}
+}
+
+func ttlMapCleanup() {
+	for {
+		time.Sleep(1 * time.Second)
+
+		now := time.Now()
+
+		mu.Lock()
+		for key, expiry := range ttlMap {
+			if now.After(expiry) {
+				delete(ttlMap, key)
+				delete(globalCache, key)
+			}
+		}
+		mu.Unlock()
 	}
 }
 
 func main() {
 	fmt.Println("Server starting...")
+
+	// Start cleanup goroutine ONCE
+	go ttlMapCleanup()
 
 	ln, err := net.Listen("tcp", ":8080")
 	if err != nil {
